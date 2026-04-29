@@ -146,27 +146,39 @@ function TagRow({ title, tags, tagType, color }: { title: string; tags: TagGroup
 }
 
 function ClassCard({ cls, samples }: { cls: ClassItem; samples: ImageItem[] }) {
+  const hasSamples = samples.length > 0;
   return (
     <div className="card" style={{ padding: "1rem", overflow: "hidden" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.75rem" }}>
         <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>{cls.name}</h2>
         <span style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>id {cls.id}</span>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "4px", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
-        {samples.slice(0, 8).map((img, idx) => (
-          <Link
-            key={img.imageRel}
-            to={`/image/${encodeURIComponent(img.split)}/${encodeURIComponent(img.name)}`}
-            state={{ list: samples, index: idx, classId: String(cls.id) }}
-            style={{ aspectRatio: "1", display: "block", background: "var(--color-border)" }}
-          >
-            <img src={api.imageUrl(img.split, img.name)} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} loading="lazy" />
-          </Link>
-        ))}
-      </div>
-      <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-        <Link to={`/class/${cls.id}`} className="btn btn-ghost" style={{ fontSize: "0.85rem", padding: "0.35rem 0.6rem" }}>View all</Link>
-      </div>
+      {hasSamples ? (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "4px", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
+            {samples.slice(0, 8).map((img, idx) => (
+              <Link
+                key={img.imageRel}
+                to={`/image/${encodeURIComponent(img.split)}/${encodeURIComponent(img.name)}`}
+                state={{ list: samples, index: idx, classId: String(cls.id) }}
+                style={{ aspectRatio: "1", display: "block", background: "var(--color-border)" }}
+              >
+                <img src={api.imageUrl(img.split, img.name)} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} loading="lazy" />
+              </Link>
+            ))}
+          </div>
+          <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+            <Link to={`/class/${cls.id}`} className="btn btn-ghost" style={{ fontSize: "0.85rem", padding: "0.35rem 0.6rem" }}>View all</Link>
+          </div>
+        </>
+      ) : (
+        <div style={{
+          padding: "1.5rem 1rem", textAlign: "center", borderRadius: "var(--radius-sm)",
+          background: "oklch(0 0 0 / 0.03)", border: "1px dashed var(--color-border)",
+        }}>
+          <span style={{ fontSize: "0.9rem", color: "var(--color-text-muted)" }}>No detections in dataset</span>
+        </div>
+      )}
     </div>
   );
 }

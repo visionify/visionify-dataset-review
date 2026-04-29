@@ -139,7 +139,10 @@ async function resolveConfig(datasetRoot) {
   for (const name of ["data.yaml", "dataset.yaml", "dataset_weighted.yaml"]) {
     try {
       const yamlData = yaml.load(await fs.readFile(path.join(datasetRoot, name), "utf8"));
-      if (yamlData) { names = normalizeClassNames(yamlData); break; }
+      if (yamlData) {
+        const parsed = normalizeClassNames(yamlData);
+        if (Object.keys(parsed).length > 0) { names = parsed; break; }
+      }
     } catch {}
   }
 
