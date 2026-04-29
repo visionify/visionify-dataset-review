@@ -112,6 +112,8 @@ async function findCvatDataDir(datasetRoot) {
   return null;
 }
 
+const DEFAULT_NAMES = { 0: "hboard", 1: "pallet", 2: "vboard", 3: "person", 4: "forklift" };
+
 async function resolveConfig(datasetRoot) {
   if (_cfgCache && _cfgCachePath === datasetRoot) return _cfgCache;
 
@@ -132,23 +134,22 @@ async function resolveConfig(datasetRoot) {
     return cfg;
   }
 
-  // Standard YOLO format — find and parse YAML
-  let yamlData = null;
+  // Standard YOLO format — find and parse YAML, fall back to hardcoded defaults
+  let names = DEFAULT_NAMES;
   for (const name of ["data.yaml", "dataset.yaml", "dataset_weighted.yaml"]) {
     try {
-      yamlData = yaml.load(await fs.readFile(path.join(datasetRoot, name), "utf8"));
-      break;
+      const yamlData = yaml.load(await fs.readFile(path.join(datasetRoot, name), "utf8"));
+      if (yamlData) { names = normalizeClassNames(yamlData); break; }
     } catch {}
   }
-  const names = yamlData ? normalizeClassNames(yamlData) : {};
 
-  // Probe filesystem for image directories
-  const trainImgs = await findDir(datasetRoot, ["images/train", "train/images", "train"], true);
+  // Probe filesystem for image directories, default to images/train
+  const trainImgs = await findDir(datasetRoot, ["images/train", "train/images", "train"], true) || "images/train";
   const valImgs   = await findDir(datasetRoot, ["images/val", "images/valid", "valid/images", "val/images", "val", "valid"], true);
   const testImgs  = await findDir(datasetRoot, ["images/test", "test/images", "test"], true);
 
-  // Probe for label directories
-  const trainLabels = await findDir(datasetRoot, ["labels/train", "train/labels"], false);
+  // Probe for label directories, default to labels/train
+  const trainLabels = await findDir(datasetRoot, ["labels/train", "train/labels"], false) || "labels/train";
   const valLabels   = await findDir(datasetRoot, ["labels/val", "labels/valid", "valid/labels", "val/labels"], false);
   const testLabels  = await findDir(datasetRoot, ["labels/test", "test/labels"], false);
 

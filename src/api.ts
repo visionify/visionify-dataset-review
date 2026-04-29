@@ -1,15 +1,33 @@
 import type { BBox, ImageTags, ValidationCheck, ImageItem, ClassItem } from "./types";
 
-const BASE = "/api";
+const LOCAL_STORAGE_KEY = "dataset-review-server-url";
+const DEFAULT_SERVER = "";
+
+export function getServerUrl(): string {
+  return localStorage.getItem(LOCAL_STORAGE_KEY) || DEFAULT_SERVER;
+}
+
+export function setServerUrl(url: string) {
+  const trimmed = url.replace(/\/+$/, "").trim();
+  if (trimmed) {
+    localStorage.setItem(LOCAL_STORAGE_KEY, trimmed);
+  } else {
+    localStorage.removeItem(LOCAL_STORAGE_KEY);
+  }
+}
+
+function base(): string {
+  return getServerUrl() + "/api";
+}
 
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(BASE + path);
+  const r = await fetch(base() + path);
   if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
   return r.json();
 }
 
 async function put<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(BASE + path, {
+  const r = await fetch(base() + path, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -19,7 +37,7 @@ async function put<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(BASE + path, {
+  const r = await fetch(base() + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -29,7 +47,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function patch<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(BASE + path, {
+  const r = await fetch(base() + path, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -86,7 +104,7 @@ export const api = {
   getClassColors: () => get<Record<number, string>>("/class-colors"),
   setClassColors: (colors: Record<number, string>) => put<Record<number, string>>("/class-colors", colors),
   deleteImage: (split: string, name: string) => {
-    return fetch(`/api/images/${encodeURIComponent(split)}/${encodeURIComponent(name)}`, { method: "DELETE" }).then((r) => {
+    return fetch(`${getServerUrl()}/api/images/${encodeURIComponent(split)}/${encodeURIComponent(name)}`, { method: "DELETE" }).then((r) => {
       if (!r.ok) throw new Error(r.statusText);
       return r.json();
     });
@@ -98,8 +116,8 @@ export const api = {
   },
   getClassSamples: (classId: number, limit?: number) =>
     get<{ samples: ImageItem[] }>(`/class/${classId}/samples?limit=${limit ?? 8}`),
-  imageUrl: (split: string, name: string) => `/api/images/${encodeURIComponent(split)}/${encodeURIComponent(name)}`,
-  assetUrl: (relPath: string) => `/dataset-asset/${relPath.replace(/^\//, "")}`,
+  imageUrl: (split: string, name: string) => `${getServerUrl()}/api/images/${encodeURIComponent(split)}/${encodeURIComponent(name)}`,
+  assetUrl: (relPath: string) => `${getServerUrl()}/dataset-asset/${relPath.replace(/^\//, "")}`,
   getAnnotations: (split: string, base: string) =>
     get<BBox[]>(`/annotations/${encodeURIComponent(split)}/${encodeURIComponent(base)}`),
   saveAnnotations: (split: string, base: string, boxes: BBox[]) =>

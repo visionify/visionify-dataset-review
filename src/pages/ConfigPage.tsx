@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { api } from "@/api";
+import { api, getServerUrl, setServerUrl } from "@/api";
 
 /** Turn a file:// URL or path string into an absolute path (no file://). */
 function fileUrlToPath(url: string): string {
@@ -35,10 +35,18 @@ export default function ConfigPage() {
   const [dropMessage, setDropMessage] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const [serverUrl, setServerUrlLocal] = useState(getServerUrl);
+  const [serverOk, setServerOk] = useState<boolean | null>(null);
 
   useEffect(() => {
-    api.getConfig().then((c) => setPath(c.datasetPath || ""));
+    api.getConfig().then((c) => { setPath(c.datasetPath || ""); setServerOk(true); }).catch(() => setServerOk(false));
   }, []);
+
+  const saveServerUrl = () => {
+    setServerUrl(serverUrl);
+    setServerOk(null);
+    api.getConfig().then((c) => { setPath(c.datasetPath || ""); setServerOk(true); }).catch(() => setServerOk(false));
+  };
 
   const applyPath = useCallback(
     async (newPath: string) => {
@@ -124,6 +132,26 @@ export default function ConfigPage() {
 
   return (
     <div className="card" style={{ padding: "1.5rem", maxWidth: "36rem" }}>
+      <h1 style={{ fontSize: "1.25rem", marginBottom: "0.75rem" }}>Server Connection</h1>
+      <p style={{ color: "var(--color-text-muted)", marginBottom: "0.75rem", fontSize: "0.9rem" }}>
+        Enter the URL of your local server (e.g. <code>http://localhost:3456</code>). Leave empty if running locally on the same machine.
+      </p>
+      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.5rem" }}>
+        <input
+          type="text"
+          className="input"
+          value={serverUrl}
+          onChange={(e) => setServerUrlLocal(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") saveServerUrl(); }}
+          placeholder="http://localhost:3456"
+          style={{ flex: 1, padding: "0.4rem 0.6rem" }}
+        />
+        <button className="btn btn-primary" onClick={saveServerUrl}>Connect</button>
+      </div>
+      {serverOk === true && <p style={{ fontSize: "0.85rem", color: "var(--color-success)" }}>Connected</p>}
+      {serverOk === false && <p style={{ fontSize: "0.85rem", color: "var(--color-warning)" }}>Cannot reach server. Make sure <code>node server/index.js</code> is running.</p>}
+
+      <hr style={{ margin: "1.5rem 0", border: "none", borderTop: "1px solid var(--color-border)" }} />
       <h1 style={{ fontSize: "1.25rem", marginBottom: "0.75rem" }}>Dataset</h1>
       <p style={{ color: "var(--color-text-muted)", marginBottom: "1rem", fontSize: "0.9rem" }}>
         Enter the <strong>full path</strong> to your YOLO dataset folder (the one that contains{" "}

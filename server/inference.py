@@ -21,6 +21,8 @@ except ImportError:
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 _model = None
 _model_path = None
 
@@ -53,7 +55,8 @@ def health():
 @app.post("/load")
 def load_model(req: LoadRequest):
     global _model, _model_path
-    p = os.path.expanduser(req.model_path)
+    raw = os.path.expanduser(req.model_path)
+    p = raw if os.path.isabs(raw) else str(PROJECT_ROOT / raw)
     if not os.path.isfile(p):
         raise HTTPException(400, f"Model file not found: {p}")
     try:

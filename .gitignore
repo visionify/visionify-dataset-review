@@ -3,3 +3,4 @@ dist
 dataset-path.json
 .env
 *.log
+models/
