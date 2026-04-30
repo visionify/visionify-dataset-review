@@ -50,8 +50,14 @@ export default function SettingsPage() {
       setModelStatus({ loaded: true, classes: r.classes });
       setModelMsg(`Loaded with ${Object.keys(r.classes).length} classes`);
       setTimeout(() => setModelMsg(null), 3000);
-    } catch (e) { setModelMsg(e instanceof Error ? e.message : "Load failed"); }
-    finally { setModelLoading(false); }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Load failed";
+      if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("ERR_CONNECTION")) {
+        setModelMsg("Could not reach the server. Make sure both servers are running on your machine (./start.sh).");
+      } else {
+        setModelMsg(msg);
+      }
+    } finally { setModelLoading(false); }
   };
 
   const unloadModel = async () => {

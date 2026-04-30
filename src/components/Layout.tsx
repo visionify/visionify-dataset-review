@@ -5,10 +5,20 @@ import { api } from "@/api";
 export default function Layout({ children }: { children: React.ReactNode }) {
   const loc = useLocation();
   const [summary, setSummary] = useState<Awaited<ReturnType<typeof api.getSummary>> | null>(null);
+  const [serverDown, setServerDown] = useState(false);
 
   const shouldRefetch = loc.pathname === "/" || loc.pathname === "/config" || loc.pathname.startsWith("/images");
   useEffect(() => {
-    if (shouldRefetch || !summary) api.getSummary().then(setSummary).catch(() => setSummary(null));
+    if (shouldRefetch || !summary)
+      api.getSummary()
+        .then((s) => { setSummary(s); setServerDown(false); })
+        .catch((e) => {
+          setSummary(null);
+          const msg = e instanceof Error ? e.message : "";
+          if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("ERR_CONNECTION")) {
+            setServerDown(true);
+          }
+        });
   }, [shouldRefetch]);
 
   const config = summary?.config;
@@ -67,6 +77,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
       </header>
+      {serverDown && (
+        <div style={{
+          background: "#fef2f2", borderBottom: "1px solid #fecaca", padding: "0.6rem 1.5rem",
+          display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.85rem", color: "#991b1b",
+        }}>
+          <span style={{ fontWeight: 600 }}>Server unreachable.</span>
+          <span>Make sure both servers are running on your machine. Run <code style={{ background: "#fee2e2", padding: "0.1rem 0.35rem", borderRadius: 3 }}>./start.sh</code> in the project directory.</span>
+        </div>
+      )}
       <main className="main-content">{children}</main>
     </div>
   );
