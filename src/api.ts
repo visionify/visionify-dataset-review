@@ -1,4 +1,4 @@
-import type { BBox, ImageTags, ValidationCheck, ImageItem, ClassItem } from "./types";
+import type { BBox, CropRegion, ImageTags, ValidationCheck, ImageItem, ClassItem } from "./types";
 
 const BASE = "/api";
 
@@ -113,6 +113,16 @@ export const api = {
     get<ImageTags>(`/tags/${encodeURIComponent(split)}/${encodeURIComponent(base)}`),
   saveTags: (split: string, base: string, tags: ImageTags) =>
     put<{ ok: boolean }>(`/tags/${encodeURIComponent(split)}/${encodeURIComponent(base)}`, tags),
+  // Crop — export a sub-region to the sibling "<dataset>-cropped" dataset
+  cropImage: (split: string, name: string, region: CropRegion) =>
+    post<{ ok: boolean; outputRoot: string; outImage: string; kept: number; dropped: number; width: number; height: number }>(
+      "/crop", { split, name, region }
+    ),
+  cropStatus: (split: string, name: string) =>
+    get<{ exists: boolean; outputRoot: string | null }>(
+      `/crop/status?split=${encodeURIComponent(split)}&name=${encodeURIComponent(name)}`
+    ),
+
   patchMetadata: (data: Record<string, unknown>) => patch<Record<string, unknown>>("/metadata", data),
   fixDuplicateLabels: () => post<{ ok: boolean; filesFixed: number; linesRemoved: number }>("/validation/fix-duplicates", {}),
   deleteMissingLabelImages: () => post<{ ok: boolean; deleted: number }>("/validation/delete-missing-labels", {}),

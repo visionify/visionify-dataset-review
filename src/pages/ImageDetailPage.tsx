@@ -3,9 +3,11 @@ import { Link, useParams, useLocation, useNavigate } from "react-router-dom";
 import { api, imageBase, imageSrc } from "@/api";
 import type { PredictionBox } from "@/api";
 import { BBoxCanvas } from "@/components/BBoxCanvas";
-import type { BBox, ImageItem, ClassItem } from "@/types";
+import type { CropMode } from "@/components/BBoxCanvas";
+import type { BBox, CropRegion, ImageItem, ClassItem } from "@/types";
 
 const DEFAULT_CLASS_KEY = "pallet-review-default-class";
+const CROP_REGION_KEY = "pallet-review-crop-region";
 const LOAD_LIMIT = 5000;
 
 export default function ImageDetailPage() {
@@ -43,6 +45,13 @@ export default function ImageDetailPage() {
   const [confidence, setConfidence] = useState(0.25);
   const [moveTarget, setMoveTarget] = useState("");
   const [moving, setMoving] = useState(false);
+  const [cropRegion, setCropRegionState] = useState<CropRegion | null>(null);
+  const [cropMode, setCropMode] = useState<CropMode>(null);
+  const [cropping, setCropping] = useState(false);
+  const [cropExists, setCropExists] = useState(false);
+  const [messageKind, setMessageKind] = useState<"success" | "error">("success");
+  const [cropInfo, setCropInfo] = useState<string | null>(null);
+  const cropInFlight = useRef(false);
   const boxesRef = useRef(boxes);
   boxesRef.current = boxes;
   const loadedImageRef = useRef<{ split: string; name: string } | null>(null);
@@ -55,11 +64,42 @@ export default function ImageDetailPage() {
     try { localStorage.setItem(DEFAULT_CLASS_KEY, String(id)); } catch {}
   }, []);
 
-  // Load persisted default class
+  /**
+   * Transient status. Rendered into a fixed-size slot (and, for errors, an
+   * absolutely-positioned toast) so showing/hiding it never reflows the toolbar
+   * and never shifts the image below it.
+   */
+  const notify = useCallback((text: string, kind: "success" | "error" = "success", ms = 2500) => {
+    setMessage(text);
+    setMessageKind(kind);
+    setTimeout(() => setMessage(null), ms);
+  }, []);
+
+  // The crop region persists across images (and reloads) so a whole scene can be
+  // swept with a single keystroke per image.
+  const setCropRegion = useCallback((r: CropRegion | null) => {
+    setCropRegionState(r);
+    try {
+      if (r) localStorage.setItem(CROP_REGION_KEY, JSON.stringify(r));
+      else localStorage.removeItem(CROP_REGION_KEY);
+    } catch {}
+  }, []);
+
+  // Load persisted default class + crop region
   useEffect(() => {
     try {
       const s = localStorage.getItem(DEFAULT_CLASS_KEY);
       if (s != null) { const n = parseInt(s, 10); if (!isNaN(n)) setDefaultClassIdState(n); }
+    } catch {}
+    try {
+      const s = localStorage.getItem(CROP_REGION_KEY);
+      if (s) {
+        const r = JSON.parse(s) as CropRegion;
+        const validPoly = r?.polygon == null
+          || (Array.isArray(r.polygon) && r.polygon.length >= 3
+              && r.polygon.every(p => Array.isArray(p) && p.length === 2 && p.every(v => typeof v === "number" && isFinite(v))));
+        if ([r?.x0, r?.y0, r?.x1, r?.y1].every(v => typeof v === "number" && isFinite(v)) && validPoly) setCropRegionState(r);
+      }
     } catch {}
   }, []);
 
@@ -148,8 +188,14 @@ export default function ImageDetailPage() {
     setIsReviewed(false);
     setPredictions([]);
     setBoxes([]);
+    setCropExists(false);
+    setCropInfo(null);
 
     let stale = false;
+
+    if (!isCls) {
+      api.cropStatus(s, n).then(r => { if (!stale) setCropExists(r.exists); }).catch(() => {});
+    }
 
     const promises: [Promise<BBox[]>, Promise<Record<string, unknown>>, Promise<{ reviewed: string[] }>] = [
       isCls ? Promise.resolve([]) : api.getAnnotations(s, b),
@@ -322,6 +368,55 @@ export default function ImageDetailPage() {
     setPredictions(prev => prev.filter((_, i) => i !== index));
   }, [predictions]);
 
+  // Write the current crop region (image + remapped labels) to <dataset>-cropped
+  const applyCrop = useCallback(async () => {
+    if (!currentImage || isCls) return;
+    // Re-entrancy guard: a ref, not the `cropping` state, so a second keypress in
+    // the same tick can't slip through before React re-renders.
+    if (cropInFlight.current) return;
+    if (!cropRegion) { notify("Set a crop region first", "error"); return; }
+    if (cropMode) return;
+
+    // Never write annotations that don't belong to the image on screen: until the
+    // fetch completes, boxesRef holds [] (or the previous image's boxes), and
+    // saving that would wipe the source labels. Same guard autoSaveAndMark uses.
+    const loaded = loadedImageRef.current;
+    if (!loaded || loaded.split !== currentImage.split || loaded.name !== currentImage.name) {
+      notify("Still loading annotations — try again", "error");
+      return;
+    }
+
+    cropInFlight.current = true;
+    setCropping(true);
+    try {
+      // Persist any in-progress annotation edits first — the crop reads labels from disk
+      await api.saveAnnotations(currentImage.split, imageBase(currentImage.name), boxesRef.current);
+      const r = await api.cropImage(currentImage.split, currentImage.name, cropRegion);
+      setCropExists(true);
+      markReviewed();
+      setCropInfo(`Cropped ${r.width}×${r.height} · ${r.kept} box${r.kept === 1 ? "" : "es"} kept${r.dropped ? `, ${r.dropped} dropped` : ""}`);
+      notify("Cropped", "success");
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "Crop failed", "error", 4000);
+    } finally {
+      cropInFlight.current = false;
+      setCropping(false);
+    }
+  }, [currentImage, cropRegion, cropMode, isCls, markReviewed, notify]);
+
+  const startCrop = useCallback((mode: "rect" | "polygon") => {
+    setCropRegion(null);
+    setCropMode(mode);
+    setSelectedIndex(null);
+  }, [setCropRegion]);
+
+  const handleCropRegionChange = useCallback((r: CropRegion | null) => {
+    setCropRegion(r);
+    // A region drawn from scratch ends draw mode; vertex drags on an existing
+    // polygon arrive with cropMode already null and must not re-trigger it.
+    if (r && cropMode) setCropMode(null);
+  }, [setCropRegion, cropMode]);
+
   const acceptAllPredictions = useCallback(() => {
     const newBoxes = predictions.map(p => ({ classId: p.classId, x: p.x, y: p.y, w: p.w, h: p.h }));
     setBoxes(prev => [...prev, ...newBoxes]);
@@ -352,6 +447,13 @@ export default function ImageDetailPage() {
       if (!isCls && e.ctrlKey && e.key === "s") { e.preventDefault(); saveAnnotations(); return; }
       if (e.key === "t" && !e.ctrlKey && !e.metaKey && !e.altKey) { setShowTags(s => !s); return; }
       if (!isCls && e.key === "c" && !e.ctrlKey && !e.metaKey && selectedIndex !== null) { e.preventDefault(); cycleBoxClass(); return; }
+      // X only ever *saves* the crop — setting/clearing the region is UI-driven.
+      if (!isCls && (e.key === "x" || e.key === "X") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        applyCrop();
+        return;
+      }
+      if (e.key === "Escape" && cropMode) { e.preventDefault(); setCropMode(null); return; }
       if (e.key === " ") { e.preventDefault(); handleThumbsUp(); return; }
       if (!isCls && e.key === "a" && !e.ctrlKey && !e.metaKey && selectedIndex === null) { e.preventDefault(); if (predictions.length) acceptAllPredictions(); else handleAutoDetect(); return; }
 
@@ -371,7 +473,7 @@ export default function ImageDetailPage() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isCls, selectedIndex, saveAnnotations, classes.length, goPrev, goNext, handleDeleteImage, handleThumbsUp, cycleBoxClass, handleSelectedClassChange, predictions.length, acceptAllPredictions, handleAutoDetect]);
+  }, [isCls, selectedIndex, saveAnnotations, classes.length, goPrev, goNext, handleDeleteImage, handleThumbsUp, cycleBoxClass, handleSelectedClassChange, predictions.length, acceptAllPredictions, handleAutoDetect, applyCrop, cropMode]);
 
   const addTag = () => setTagList(prev => [...prev, ["", ""]]);
   const updateTag = (i: number, k: 0 | 1, v: string) =>
@@ -395,7 +497,9 @@ export default function ImageDetailPage() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: "80vh" }}>
       {/* Compact toolbar */}
-      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "0.5rem", padding: "0.4rem 0.75rem", borderBottom: "1px solid var(--color-border)", background: "var(--color-surface)", fontSize: "0.85rem" }}>
+      {/* nowrap + horizontal scroll: the toolbar can never change height, so nothing
+          below it ever shifts when transient controls appear or disappear. */}
+      <div style={{ position: "relative", display: "flex", flexWrap: "nowrap", overflowX: "auto", alignItems: "center", gap: "0.5rem", padding: "0.4rem 0.75rem", borderBottom: "1px solid var(--color-border)", background: "var(--color-surface)", fontSize: "0.85rem" }}>
         <Link to={backLink} className="btn btn-ghost" style={{ padding: "0.3rem 0.5rem" }}>← Back</Link>
 
         <button className="btn btn-ghost" style={{ padding: "0.3rem 0.5rem" }} onClick={goPrev} disabled={!hasPrev}>←</button>
@@ -463,6 +567,57 @@ export default function ImageDetailPage() {
           <>
             <span style={{ borderLeft: "1px solid var(--color-border)", height: "1.2rem" }} />
 
+            {cropMode ? (
+              <>
+                <span style={{ fontSize: "0.8rem", color: "#b45309", fontWeight: 600, whiteSpace: "nowrap" }}>
+                  {cropMode === "rect"
+                    ? "Drag to set crop region"
+                    : "Click to add points · click the first point or double-click to close"}
+                </span>
+                <button className="btn btn-ghost" onClick={() => setCropMode(null)} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}>
+                  Cancel (Esc)
+                </button>
+              </>
+            ) : cropRegion ? (
+              <>
+                {/* Fixed width so the "Cropping…" label can't resize the button */}
+                <button className="btn btn-primary" onClick={applyCrop} disabled={cropping} style={{ padding: "0.3rem 0.6rem", background: "#f59e0b", borderColor: "#f59e0b", minWidth: "6.5rem", whiteSpace: "nowrap" }} title="Save this region + its labels to <dataset>-cropped (X)">
+                  {cropping ? "Cropping…" : "✂ Crop (X)"}
+                </button>
+                <span style={{ fontSize: "0.75rem", color: "var(--color-text-muted)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                  {Math.round((cropRegion.x1 - cropRegion.x0) * 100)}%×{Math.round((cropRegion.y1 - cropRegion.y0) * 100)}%
+                  {cropRegion.polygon ? ` · ⬠${cropRegion.polygon.length}` : ""}
+                </span>
+                <button className="btn btn-ghost" onClick={() => startCrop("rect")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Clear the region and drag a new rectangle">
+                  ▭
+                </button>
+                <button className="btn btn-ghost" onClick={() => startCrop("polygon")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Clear the region and click a new polygon">
+                  ⬠
+                </button>
+                <button className="btn btn-ghost" onClick={() => setCropRegion(null)} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Remove the crop region">
+                  Clear
+                </button>
+                {/* Always rendered — only its visibility toggles, so it never reflows */}
+                <span
+                  style={{ fontSize: "0.75rem", padding: "1px 6px", borderRadius: 3, background: "rgba(245,158,11,0.18)", color: "#b45309", fontWeight: 600, whiteSpace: "nowrap", visibility: cropExists ? "visible" : "hidden" }}
+                  title="This image has already been written to the cropped dataset"
+                >
+                  ✓ cropped
+                </span>
+              </>
+            ) : (
+              <>
+                <button className="btn btn-ghost" onClick={() => startCrop("rect")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", whiteSpace: "nowrap" }} title="Drag a rectangular crop region, then press X to save crops">
+                  ▭ Rect crop
+                </button>
+                <button className="btn btn-ghost" onClick={() => startCrop("polygon")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", whiteSpace: "nowrap" }} title="Click a polygon crop region — area outside it is grey-filled, matching inference-time masking">
+                  ⬠ Polygon crop
+                </button>
+              </>
+            )}
+
+            <span style={{ borderLeft: "1px solid var(--color-border)", height: "1.2rem" }} />
+
             {modelReady ? (
               <>
                 <button className="btn btn-ghost" onClick={handleAutoDetect} disabled={detecting} style={{ padding: "0.3rem 0.5rem" }} title="Run model (A)">
@@ -484,12 +639,24 @@ export default function ImageDetailPage() {
           </>
         )}
 
-        {message && <span style={{ color: "var(--color-success)", fontSize: "0.8rem" }}>{message}</span>}
+        {/* Fixed-size status slot — content changes, footprint never does */}
+        <span
+          style={{ flex: "0 0 1.1rem", width: "1.1rem", textAlign: "center", fontSize: "0.95rem", fontWeight: 700, lineHeight: 1, color: messageKind === "error" ? "var(--color-danger)" : "var(--color-success)" }}
+          title={message ?? ""}
+        >
+          {message ? (messageKind === "error" ? "✗" : "✓") : " "}
+        </span>
+        {/* Errors also get a toast, absolutely positioned so it floats over the image */}
+        {message && messageKind === "error" && (
+          <div style={{ position: "absolute", top: "100%", right: "0.75rem", marginTop: 4, zIndex: 20, background: "var(--color-danger)", color: "#fff", padding: "0.25rem 0.6rem", borderRadius: 4, fontSize: "0.8rem", boxShadow: "0 2px 8px rgba(0,0,0,0.25)" }}>
+            {message}
+          </div>
+        )}
 
         <span style={{ marginLeft: "auto", color: "var(--color-text-muted)", whiteSpace: "nowrap", fontSize: "0.75rem" }}>
           {isCls
             ? "← → nav · Space approve · Del delete · T tags"
-            : "A auto-detect/accept · ← → nav · Space approve · D del box · C cycle class"
+            : "A auto-detect · ← → nav · Space approve · D del box · C cycle class · X save crop"
           }
         </span>
       </div>
@@ -530,13 +697,16 @@ export default function ImageDetailPage() {
             onBoxesChange={handleBoxesChange}
             onDoubleClickBox={cycleBoxClass}
             onAcceptPrediction={acceptPrediction}
+            cropRegion={cropRegion}
+            cropMode={cropMode}
+            onCropRegionChange={handleCropRegionChange}
             fill
           />
         )}
       </div>
 
       {/* Bottom status */}
-      <div style={{ minHeight: "36px", borderTop: "1px solid var(--color-border)", display: "flex", alignItems: "center", padding: "0.25rem 0.75rem", gap: "0.5rem", flexWrap: "wrap", background: "var(--color-surface)", fontSize: "0.85rem" }}>
+      <div style={{ height: "36px", flex: "0 0 36px", borderTop: "1px solid var(--color-border)", display: "flex", alignItems: "center", padding: "0.25rem 0.75rem", gap: "0.5rem", flexWrap: "nowrap", overflowX: "auto", background: "var(--color-surface)", fontSize: "0.85rem" }}>
         {isCls ? (
           <>
             <span style={{ color: "var(--color-text-muted)", fontSize: "0.8rem" }}>{currentImage.name}</span>
@@ -571,7 +741,9 @@ export default function ImageDetailPage() {
                 </>
               );
             })() : (
-              <span style={{ color: "var(--color-text-muted)", fontSize: "0.8rem" }}>Drag to draw · Click box to select/resize · D delete box · Space = approve & next</span>
+              <span style={{ color: cropInfo ? "var(--color-success)" : "var(--color-text-muted)", fontSize: "0.8rem", whiteSpace: "nowrap" }}>
+                {cropInfo ?? "Drag to draw · Click box to select/resize · D delete box · Space = approve & next"}
+              </span>
             )}
             {classSort && (
               <span style={{ marginLeft: "auto", fontSize: "0.75rem", color: "var(--color-text-muted)", background: "rgba(0,0,0,0.06)", padding: "1px 6px", borderRadius: 3 }}>

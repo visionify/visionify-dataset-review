@@ -21,6 +21,25 @@ export interface BBox {
   h: number;
 }
 
+/** Normalized (0–1) polygon vertex. */
+export type CropPoint = [number, number];
+
+/**
+ * Normalized (0–1) crop region, persisted across images while sweeping a scene.
+ *
+ * `x0..y1` is always the region's bounding box — the rectangle the image is
+ * actually cropped to. When `polygon` is present the bbox is derived from it and
+ * pixels inside the bbox but outside the polygon are grey-filled on export, so
+ * training data matches what the model sees at inference time.
+ */
+export interface CropRegion {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  polygon?: CropPoint[];
+}
+
 export interface ImageTags {
   day?: boolean;
   night?: boolean;

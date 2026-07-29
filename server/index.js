@@ -6,10 +6,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import yaml from "js-yaml";
+import sharp from "sharp";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 3456;
+const PORT = process.env.PORT || 3456;
 
 const IMG_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif"]);
 function stripImageExt(name) {
@@ -20,7 +21,9 @@ function stripImageExt(name) {
 app.use(cors());
 app.use(express.json());
 
-const CONFIG_PATH = path.join(__dirname, "..", "dataset-path.json");
+// DATASET_CONFIG_PATH lets a throwaway server instance point at its own dataset
+// without disturbing the running app's dataset-path.json.
+const CONFIG_PATH = process.env.DATASET_CONFIG_PATH || path.join(__dirname, "..", "dataset-path.json");
 const DEFAULT_DATASET_PATH = process.env.DATASET_PATH || "";
 
 function getDatasetPath() {
@@ -997,6 +1000,272 @@ app.put("/api/annotations/:split/:base", async (req, res) => {
     meta.lastSavedAnnotation = { split, base, at: new Date().toISOString() };
     await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
   } catch {}
+});
+
+// ---------------------------------------------------------------------------
+// Crop — export a sub-region of an image (plus its labels) to a sibling dataset
+// ---------------------------------------------------------------------------
+
+// A box straddling the crop boundary is kept (clipped) only if at least this
+// fraction of its original area survives the crop.
+const CROP_KEEP_THRESHOLD = 0.5;
+
+// Fill for pixels inside the crop rect but outside the crop polygon. 114 is the
+// grey Ultralytics letterboxes with, so the model already reads it as "no content"
+// — and the inference-time masking must use this same value.
+const CROP_MASK_GREY = 114;
+
+/** Shoelace area of a polygon given as [[x,y], ...]. Always non-negative. */
+function polygonArea(pts) {
+  let a = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    a += pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1];
+  }
+  return Math.abs(a) / 2;
+}
+
+/**
+ * Sutherland–Hodgman: clip `pts` against an axis-aligned rect {x0,y0,x1,y1}.
+ * The rect is convex, so this is exact for any (even concave) subject polygon.
+ */
+function clipPolygonToRect(pts, rect) {
+  const edges = [
+    { inside: p => p[0] >= rect.x0, isect: (a, b) => [rect.x0, a[1] + ((b[1] - a[1]) * (rect.x0 - a[0])) / (b[0] - a[0])] },
+    { inside: p => p[0] <= rect.x1, isect: (a, b) => [rect.x1, a[1] + ((b[1] - a[1]) * (rect.x1 - a[0])) / (b[0] - a[0])] },
+    { inside: p => p[1] >= rect.y0, isect: (a, b) => [a[0] + ((b[0] - a[0]) * (rect.y0 - a[1])) / (b[1] - a[1]), rect.y0] },
+    { inside: p => p[1] <= rect.y1, isect: (a, b) => [a[0] + ((b[0] - a[0]) * (rect.y1 - a[1])) / (b[1] - a[1]), rect.y1] },
+  ];
+  let out = pts;
+  for (const { inside, isect } of edges) {
+    const input = out;
+    out = [];
+    for (let i = 0, j = input.length - 1; i < input.length; j = i++) {
+      const cur = input[i], prev = input[j];
+      const curIn = inside(cur), prevIn = inside(prev);
+      if (curIn) {
+        if (!prevIn) out.push(isect(prev, cur));
+        out.push(cur);
+      } else if (prevIn) {
+        out.push(isect(prev, cur));
+      }
+    }
+    if (out.length === 0) return [];
+  }
+  return out;
+}
+
+/** Bounding box of a normalized polygon. */
+function polygonBounds(poly) {
+  const xs = poly.map(p => p[0]), ys = poly.map(p => p[1]);
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+}
+
+/** Sibling output root: /data/boards -> /data/boards-cropped */
+function cropOutputRoot(datasetRoot) {
+  return path.resolve(datasetRoot) + "-cropped";
+}
+
+/** Label dir for a split, falling back to the conventional sibling of the images dir. */
+function labelsRelFor(config, split) {
+  const explicit = config.labelsDir?.[split];
+  if (explicit) return explicit;
+  const imagesRel = config[split];
+  if (!imagesRel) return null;
+  if (/(^|\/)images$/.test(imagesRel)) return imagesRel.replace(/(^|\/)images$/, "$1labels");
+  if (/^images(\/|$)/.test(imagesRel)) return imagesRel.replace(/^images/, "labels");
+  return `labels/${split}`;
+}
+
+/**
+ * Re-map YOLO boxes into crop-local normalized coords.
+ * `crop` is in source-image pixels; W/H are the source image dimensions.
+ * Boxes are clipped to the crop and dropped when < CROP_KEEP_THRESHOLD survives.
+ *
+ * `polyPx` (optional, source pixels) is the mask polygon. Area outside it is
+ * grey-filled on export, so a box's *visible* area is its overlap with the
+ * polygon — not merely with the crop rect. Without this, a board sitting fully
+ * inside the crop rect but under grey would keep its label and teach the model
+ * to detect objects that aren't there.
+ */
+function remapBoxesToCrop(boxes, crop, W, H, polyPx) {
+  const kept = [];
+  let dropped = 0;
+  for (const b of boxes) {
+    // Box edges in source pixels
+    const bx0 = (b.x - b.w / 2) * W, bx1 = (b.x + b.w / 2) * W;
+    const by0 = (b.y - b.h / 2) * H, by1 = (b.y + b.h / 2) * H;
+    const origArea = Math.max(0, bx1 - bx0) * Math.max(0, by1 - by0);
+    if (origArea <= 0) { dropped++; continue; }
+
+    const ix0 = Math.max(bx0, crop.left), ix1 = Math.min(bx1, crop.left + crop.width);
+    const iy0 = Math.max(by0, crop.top), iy1 = Math.min(by1, crop.top + crop.height);
+    const iw = ix1 - ix0, ih = iy1 - iy0;
+    if (iw <= 0 || ih <= 0) { dropped++; continue; }
+
+    // Visible area: exact polygon∩box when masking, else the rect intersection
+    const visibleArea = polyPx
+      ? polygonArea(clipPolygonToRect(polyPx, { x0: bx0, y0: by0, x1: bx1, y1: by1 }))
+      : iw * ih;
+    if (visibleArea / origArea < CROP_KEEP_THRESHOLD) { dropped++; continue; }
+
+    kept.push({
+      classId: b.classId,
+      x: (ix0 + ix1) / 2 - crop.left,
+      y: (iy0 + iy1) / 2 - crop.top,
+      w: iw,
+      h: ih,
+    });
+  }
+  // Normalize against the cropped image size
+  return {
+    boxes: kept.map(b => ({
+      classId: b.classId,
+      x: b.x / crop.width,
+      y: b.y / crop.height,
+      w: b.w / crop.width,
+      h: b.h / crop.height,
+    })),
+    dropped,
+  };
+}
+
+/** Copy dataset-level metadata files (data.yaml etc.) into the output root, once. */
+async function copyDatasetMetaFiles(datasetRoot, outRoot) {
+  for (const name of ["data.yaml", "dataset.yaml", "dataset_weighted.yaml", "obj.names"]) {
+    const src = path.join(datasetRoot, name);
+    const dst = path.join(outRoot, name);
+    try {
+      await fs.access(dst);
+      continue; // already copied
+    } catch {}
+    try { await fs.copyFile(src, dst); } catch {}
+  }
+}
+
+/** Resolve source/output paths for a croppable image, or an { error, status } object. */
+async function resolveCropPaths(datasetRoot, split, name) {
+  if (!datasetRoot.trim()) return { error: "no dataset configured", status: 400 };
+  const config = await resolveConfig(datasetRoot);
+  if (config.type === "classification") return { error: "crop is only supported for detection datasets", status: 400 };
+
+  const imagesRel = config[split];
+  if (!imagesRel) return { error: `split not found: ${split}`, status: 404 };
+
+  const srcImage = path.join(datasetRoot, imagesRel, name);
+  if (!srcImage.startsWith(path.resolve(datasetRoot))) return { error: "forbidden", status: 403 };
+
+  const outRoot = cropOutputRoot(datasetRoot);
+  const labelsRel = labelsRelFor(config, split);
+  const base = stripImageExt(name);
+  return {
+    config, imagesRel, labelsRel, base, srcImage, outRoot,
+    srcLabel: labelsRel ? path.join(datasetRoot, labelsRel, base + ".txt") : null,
+    outImage: path.join(outRoot, imagesRel, name),
+    outLabel: labelsRel ? path.join(outRoot, labelsRel, base + ".txt") : null,
+  };
+}
+
+// Has this image already been cropped into the output dataset?
+app.get("/api/crop/status", async (req, res) => {
+  const datasetRoot = getDatasetPath();
+  const { split, name } = req.query;
+  if (!split || !name) return res.status(400).json({ error: "split and name required" });
+  const p = await resolveCropPaths(datasetRoot, String(split), String(name));
+  if (p.error) return res.json({ exists: false, outputRoot: null });
+  let exists = false;
+  try { await fs.access(p.outImage); exists = true; } catch {}
+  res.json({ exists, outputRoot: p.outRoot });
+});
+
+// Write the cropped image + remapped labels to the sibling dataset.
+app.post("/api/crop", async (req, res) => {
+  const datasetRoot = getDatasetPath();
+  const { split, name, region } = req.body || {};
+  if (!split || !name || !region) return res.status(400).json({ error: "split, name and region required" });
+
+  const p = await resolveCropPaths(datasetRoot, String(split), String(name));
+  if (p.error) return res.status(p.status).json({ error: p.error });
+
+  try {
+    const meta = await sharp(p.srcImage).metadata();
+    const W = meta.width, H = meta.height;
+    if (!W || !H) return res.status(500).json({ error: "could not read image dimensions" });
+
+    // A polygon defines its own bounding box; a bare rect uses the given corners.
+    const poly = Array.isArray(region.polygon) && region.polygon.length >= 3 ? region.polygon : null;
+    const bounds = poly ? polygonBounds(poly) : region;
+
+    // Normalized region -> integer pixel rect, clamped to the image
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const left = clamp(Math.round(Math.min(bounds.x0, bounds.x1) * W), 0, W - 1);
+    const top = clamp(Math.round(Math.min(bounds.y0, bounds.y1) * H), 0, H - 1);
+    const right = clamp(Math.round(Math.max(bounds.x0, bounds.x1) * W), left + 1, W);
+    const bottom = clamp(Math.round(Math.max(bounds.y0, bounds.y1) * H), top + 1, H);
+    const crop = { left, top, width: right - left, height: bottom - top };
+
+    // Polygon in source pixels (for label visibility) and crop-local pixels (for the mask)
+    const polyPx = poly ? poly.map(([px, py]) => [px * W, py * H]) : null;
+    const polyLocal = polyPx ? polyPx.map(([px, py]) => [px - crop.left, py - crop.top]) : null;
+
+    // Labels: read source, remap, write
+    let boxes = [];
+    if (p.srcLabel) {
+      try {
+        const content = await fs.readFile(p.srcLabel, "utf8");
+        boxes = content.split("\n").filter(l => l.trim()).map(line => {
+          const v = line.trim().split(/\s+/).map(Number);
+          return { classId: v[0], x: v[1], y: v[2], w: v[3], h: v[4] };
+        }).filter(b => Number.isFinite(b.x) && Number.isFinite(b.y) && Number.isFinite(b.w) && Number.isFinite(b.h));
+      } catch {}
+    }
+    const { boxes: remapped, dropped } = remapBoxesToCrop(boxes, crop, W, H, polyPx);
+
+    // Image
+    await fs.mkdir(path.dirname(p.outImage), { recursive: true });
+    const ext = path.extname(name).toLowerCase();
+    let pipeline = sharp(p.srcImage).extract(crop);
+
+    if (polyLocal) {
+      // Overlay a grey layer with a polygon-shaped hole (even-odd fill): pixels
+      // inside the polygon are untouched, everything else becomes CROP_MASK_GREY.
+      // Done as a single `over` composite because sharp applies flatten *before*
+      // composite in its fixed pipeline order — a dest-in + flatten pass would
+      // flatten the un-masked image and leave the masked area black.
+      const inner = polyLocal.map(([px, py], i) => `${i === 0 ? "M" : "L"} ${px.toFixed(2)} ${py.toFixed(2)}`).join(" ");
+      const d = `M 0 0 L ${crop.width} 0 L ${crop.width} ${crop.height} L 0 ${crop.height} Z ${inner} Z`;
+      const g = CROP_MASK_GREY;
+      const maskSvg = Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${crop.width}" height="${crop.height}">` +
+        `<path d="${d}" fill="rgb(${g},${g},${g})" fill-rule="evenodd"/></svg>`
+      );
+      pipeline = pipeline.composite([{ input: maskSvg, blend: "over" }]);
+    }
+
+    if (ext === ".jpg" || ext === ".jpeg") pipeline = pipeline.jpeg({ quality: 95 });
+    else if (ext === ".png") pipeline = pipeline.png();
+    else if (ext === ".webp") pipeline = pipeline.webp({ quality: 95 });
+    await pipeline.toFile(p.outImage);
+
+    if (p.outLabel) {
+      await fs.mkdir(path.dirname(p.outLabel), { recursive: true });
+      await fs.writeFile(p.outLabel, remapped.map(b => `${b.classId} ${b.x} ${b.y} ${b.w} ${b.h}`).join("\n"), "utf8");
+    }
+
+    await copyDatasetMetaFiles(datasetRoot, p.outRoot);
+
+    res.json({
+      ok: true,
+      outputRoot: p.outRoot,
+      outImage: p.outImage,
+      kept: remapped.length,
+      dropped,
+      width: crop.width,
+      height: crop.height,
+      masked: !!polyLocal,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // Tags
