@@ -112,7 +112,7 @@ async function findCvatDataDir(datasetRoot) {
   return null;
 }
 
-const DEFAULT_NAMES = { 0: "hboard", 1: "pallet", 2: "vboard", 3: "person", 4: "forklift" };
+const DEFAULT_NAMES = { 0: "hboard", 1: "pallet", 2: "vboard", 3: "person", 4: "forklift", 5: "wooden-log" };
 
 async function resolveConfig(datasetRoot) {
   if (_cfgCache && _cfgCachePath === datasetRoot) return _cfgCache;
