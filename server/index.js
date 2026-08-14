@@ -1867,6 +1867,30 @@ app.get("/api/inference/health", async (_req, res) => {
   catch { res.json({ status: "offline", model_loaded: false, model_path: null }); }
 });
 
+// Fine-tune on the annotations made so far, then predict with the result.
+// The reviewed set is resolved HERE rather than trusted from the client: only
+// images the user has actually confirmed may be trained on. An untouched image
+// has no labels, and YOLO reads that as "nothing here" — training on it would
+// teach the model that the objects it already misses are genuinely absent.
+app.post("/api/inference/finetune", async (req, res) => {
+  const datasetRoot = getDatasetPath();
+  if (!datasetRoot.trim()) return res.status(400).json({ error: "no dataset configured" });
+  try {
+    const reviewed = [...(await readReviewedSet(datasetRoot))];
+    if (!reviewed.length) return res.status(400).json({ error: "no reviewed images yet — annotate a few and mark them reviewed" });
+    res.json(await inferenceProxy("POST", "/finetune", {
+      dataset_root: datasetRoot,
+      reviewed_keys: reviewed,
+      ...(req.body || {}),
+    }));
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+});
+
+app.get("/api/inference/finetune/status", async (_req, res) => {
+  try { res.json(await inferenceProxy("GET", "/finetune/status")); }
+  catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+});
+
 app.post("/api/inference/load", async (req, res) => {
   try { res.json(await inferenceProxy("POST", "/load", req.body)); }
   catch (e) { res.status(500).json({ error: String(e.message) }); }

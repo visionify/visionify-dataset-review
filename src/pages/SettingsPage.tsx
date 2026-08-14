@@ -19,6 +19,7 @@ export default function SettingsPage() {
   const [modelStatus, setModelStatus] = useState<{ loaded: boolean; path: string | null; classes?: Record<number, string> }>({ loaded: false, path: null });
   const [modelLoading, setModelLoading] = useState(false);
   const [modelMsg, setModelMsg] = useState<string | null>(null);
+  const [ft, setFt] = useState<{ running: boolean; stage: string; message: string; epochs_done: number; epochs_total: number } | null>(null);
 
   useEffect(() => {
     api.getSummary().then((s) => setClasses(s.classes ?? [])).catch(() => {});
@@ -28,6 +29,36 @@ export default function SettingsPage() {
       if (h.model_path) setModelPath(h.model_path);
     }).catch(() => {});
   }, []);
+
+  // Poll while a fine-tune runs; stop as soon as it settles.
+  useEffect(() => {
+    if (!ft?.running) return;
+    const t = setInterval(async () => {
+      try {
+        const st = await api.inferenceFinetuneStatus();
+        setFt(st);
+        if (!st.running) {
+          setModelStatus(m => ({ ...m, path: st.model_path }));
+          if (st.model_path) setModelPath(st.model_path);
+        }
+      } catch { /* keep polling; the sidecar may be busy training */ }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [ft?.running]);
+
+  const finetune = async () => {
+    if (!window.confirm(
+      "Fine-tune on the images you have marked REVIEWED, then predict with the result?\n\n" +
+      "Only reviewed images are used — an unreviewed image has no labels, and training on it " +
+      "would teach the model that whatever it already misses is genuinely absent.\n\n" +
+      "Weights are saved under <dataset>/review/finetune/. The current model file is untouched."
+    )) return;
+    setModelMsg(null);
+    try {
+      await api.inferenceFinetune();
+      setFt({ running: true, stage: "queued", message: "", epochs_done: 0, epochs_total: 0 });
+    } catch (e) { setModelMsg(e instanceof Error ? e.message : "Fine-tune failed to start"); }
+  };
 
   const loadModel = async () => {
     if (!modelPath.trim()) return;
@@ -155,6 +186,22 @@ export default function SettingsPage() {
         <button className="btn btn-primary" onClick={loadModel} disabled={modelLoading || !modelPath.trim()}>
           {modelLoading ? "Loading…" : "Load model"}
         </button>
+        <button
+          className="btn"
+          onClick={finetune}
+          disabled={!modelStatus.loaded || !!ft?.running}
+          title="Learn from the annotations you have reviewed so far, then use the result for auto-detect"
+          style={{ marginLeft: "0.5rem" }}
+        >
+          {ft?.running ? "Learning…" : "🧠 Learn from my annotations"}
+        </button>
+        {ft && (
+          <div style={{ marginTop: "0.5rem", fontSize: "0.85rem", color: ft.stage === "error" ? "#b91c1c" : "var(--color-text-muted)" }}>
+            {ft.stage}
+            {ft.epochs_total ? ` · epoch ${ft.epochs_done}/${ft.epochs_total}` : ""}
+            {ft.message ? ` · ${ft.message}` : ""}
+          </div>
+        )}
         {modelStatus.loaded && (
           <button className="btn btn-ghost" onClick={unloadModel}>Unload</button>
         )}

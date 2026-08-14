@@ -143,6 +143,12 @@ export const api = {
 
   // Inference
   inferenceHealth: () => get<{ status: string; model_loaded: boolean; model_path: string | null }>("/inference/health"),
+  /** Fine-tune on the reviewed annotations, then predict with the result. */
+  inferenceFinetune: (epochs?: number) =>
+    post<{ ok: boolean; started: boolean }>("/inference/finetune", epochs ? { epochs } : {}),
+  inferenceFinetuneStatus: () =>
+    get<{ running: boolean; stage: string; message: string; epochs_done: number;
+          epochs_total: number; elapsed: number; model_path: string | null }>("/inference/finetune/status"),
   inferenceLoad: (modelPath: string) => post<{ ok: boolean; model_path: string; classes: Record<number, string> }>("/inference/load", { model_path: modelPath }),
   inferencePredict: (split: string, name: string, confidence?: number, iou?: number) =>
     post<{ boxes: PredictionBox[]; count: number }>("/inference/predict", { split, name, confidence, iou }),
