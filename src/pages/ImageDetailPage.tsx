@@ -427,6 +427,41 @@ export default function ImageDetailPage() {
     }
   }, [currentImage, cropRegion, extraRegions, cropMode, isCls, markReviewed, notify]);
 
+  // Draw the regions once, then export the whole dataset in one go.
+  const applyCropAll = useCallback(async () => {
+    if (cropInFlight.current) return;
+    if (!cropRegion) { notify("Set a crop region first", "error"); return; }
+    if (cropMode) return;
+    const all = [...extraRegions, cropRegion];
+    const n = all.length;
+    if (!window.confirm(
+      `Crop EVERY image in this dataset with ${n} region${n === 1 ? "" : "s"}?\n\n` +
+      `Writes to <dataset>-cropped. Background (empty-label) crops are thinned to ~10% ` +
+      `so a usually-empty zone does not swamp the set.`
+    )) return;
+
+    cropInFlight.current = true;
+    setCropping(true);
+    setCropInfo("Cropping the whole dataset…");
+    try {
+      const r = await api.cropAll(all, 0.10);
+      setCropExists(true);
+      setCropInfo(
+        `Cropped ${r.images} image${r.images === 1 ? "" : "s"} × ${r.regions} region${r.regions === 1 ? "" : "s"} ` +
+        `= ${r.cropped} crops · ${r.kept} boxes kept` +
+        (r.thinnedBackground ? ` · ${r.thinnedBackground} background removed` : "") +
+        (r.failureCount ? ` · ${r.failureCount} failed` : "")
+      );
+      notify(r.failureCount ? `Done, ${r.failureCount} failed` : "Whole dataset cropped", r.failureCount ? "error" : "success", 5000);
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "Crop all failed", "error", 5000);
+      setCropInfo(null);
+    } finally {
+      cropInFlight.current = false;
+      setCropping(false);
+    }
+  }, [cropRegion, extraRegions, cropMode, notify]);
+
   const startCrop = useCallback((mode: "rect" | "polygon") => {
     setCropRegion(null);
     setCropMode(mode);
@@ -611,6 +646,15 @@ export default function ImageDetailPage() {
                   {Math.round((cropRegion.x1 - cropRegion.x0) * 100)}%×{Math.round((cropRegion.y1 - cropRegion.y0) * 100)}%
                   {cropRegion.polygon ? ` · ⬠${cropRegion.polygon.length}` : ""}
                 </span>
+                <button
+                  className="btn btn-primary"
+                  onClick={applyCropAll}
+                  disabled={cropping}
+                  style={{ padding: "0.3rem 0.6rem", background: "#0ea5e9", borderColor: "#0ea5e9", whiteSpace: "nowrap" }}
+                  title="Crop EVERY image in the dataset with these regions, then thin background crops to ~10%"
+                >
+                  ⧉ Crop all
+                </button>
                 <button className="btn btn-ghost" onClick={() => startCrop("rect")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Clear the region and drag a new rectangle">
                   ▭
                 </button>

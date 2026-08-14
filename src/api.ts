@@ -118,6 +118,12 @@ export const api = {
     post<{ ok: boolean; outputRoot: string; outImage: string; kept: number; dropped: number; width: number; height: number }>(
       "/crop", { split, name, regions }
     ),
+  /** Crop every image in the dataset with these regions, in one request. */
+  cropAll: (regions: CropRegion[], backgroundRatio?: number) =>
+    post<{ ok: boolean; outputRoot: string; images: number; regions: number; cropped: number;
+           kept: number; dropped: number; thinnedBackground: number; failureCount: number }>(
+      "/crop/all", { regions, backgroundRatio }
+    ),
   cropStatus: (split: string, name: string) =>
     get<{ exists: boolean; outputRoot: string | null }>(
       `/crop/status?split=${encodeURIComponent(split)}&name=${encodeURIComponent(name)}`

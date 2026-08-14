@@ -1177,6 +1177,114 @@ app.get("/api/crop/status", async (req, res) => {
   res.json({ exists, outputRoot: p.outRoot });
 });
 
+/**
+ * Thin background (empty-label) crops down to a target share of the output.
+ *
+ * A region that is usually empty produces a background image on every frame.
+ * Those are worth having - they stop the model inventing detections on an empty
+ * machine, and production runs that crop whether or not anything is there - but
+ * only in moderation (~10%); past that the model is mostly rewarded for
+ * predicting nothing. Survivors are spread evenly across the set so they span
+ * different lighting and machine states rather than one idle stretch.
+ */
+async function thinBackgroundCrops(outRoot, config, ratio) {
+  const removed = [];
+  const r = Math.max(0, Math.min(0.95, ratio));
+  for (const split of activeSplits(config)) {
+    const imagesRel = config[split];
+    const labelsRel = labelsRelFor(config, split);
+    if (!imagesRel || !labelsRel) continue;
+    let files = [];
+    try { files = await listImagesInDir(path.join(outRoot, imagesRel)); } catch { continue; }
+
+    // Group by region prefix ("zone1__x.jpg" -> "zone1__"), so a busy zone is
+    // never thinned because a different zone happens to be idle.
+    const groups = new Map();
+    for (const f of files.sort()) {
+      const m = /^([A-Za-z0-9_-]+__)/.exec(f);
+      const key = m ? m[1] : "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    }
+
+    for (const [, names] of groups) {
+      const empties = [], labelled = [];
+      for (const f of names) {
+        const lp = path.join(outRoot, labelsRel, stripImageExt(f) + ".txt");
+        let txt = "";
+        try { txt = await fs.readFile(lp, "utf8"); } catch {}
+        (txt.trim() ? labelled : empties).push(f);
+      }
+      const target = Math.min(empties.length, Math.round(labelled.length * r / (1 - r)));
+      if (target >= empties.length) continue;
+      const step = target ? empties.length / target : 0;
+      const keep = new Set();
+      for (let i = 0; i < target; i++) keep.add(Math.floor(i * step));
+      for (let i = 0; i < empties.length; i++) {
+        if (keep.has(i)) continue;
+        const f = empties[i];
+        try { await fs.unlink(path.join(outRoot, imagesRel, f)); } catch {}
+        try { await fs.unlink(path.join(outRoot, labelsRel, stripImageExt(f) + ".txt")); } catch {}
+        removed.push(`${split}/${f}`);
+      }
+    }
+  }
+  return removed;
+}
+
+/**
+ * Crop EVERY image in the dataset with the given regions, in one call.
+ *
+ * Draw the regions once on any image, press the button, and the whole dataset
+ * is exported - rather than stepping through hundreds of frames pressing X.
+ */
+app.post("/api/crop/all", async (req, res) => {
+  const datasetRoot = getDatasetPath();
+  const { regions, region, backgroundRatio } = req.body || {};
+  const list = Array.isArray(regions) && regions.length ? regions : (region ? [region] : []);
+  if (!list.length) return res.status(400).json({ error: "region(s) required" });
+
+  try {
+    const config = await resolveConfig(datasetRoot);
+    if (config.type === "classification") return res.status(400).json({ error: "crop is only supported for detection datasets" });
+
+    const images = await collectAllImages(datasetRoot, config);
+    if (!images.length) return res.status(404).json({ error: "no images found" });
+
+    let cropped = 0, kept = 0, dropped = 0, outRoot = null;
+    const failures = [];
+    for (const img of images) {
+      for (let i = 0; i < list.length; i++) {
+        try {
+          const r = await cropOneRegion(datasetRoot, img.split, img.name, list[i], regionPrefix(list[i], i, list.length));
+          if (r.error) { failures.push(`${img.name}: ${r.error}`); continue; }
+          outRoot = outRoot || r.outputRoot;
+          cropped++; kept += r.kept; dropped += r.dropped;
+        } catch (e) {
+          failures.push(`${img.name}: ${e.message || e}`);
+        }
+      }
+    }
+    if (outRoot) await copyDatasetMetaFiles(datasetRoot, outRoot);
+
+    // Rebalance in the same pass, so the output is trainable as it stands.
+    let thinned = [];
+    if (outRoot && typeof backgroundRatio === "number" && backgroundRatio >= 0)
+      thinned = await thinBackgroundCrops(outRoot, config, backgroundRatio);
+
+    res.json({
+      ok: true, outputRoot: outRoot,
+      images: images.length, regions: list.length,
+      cropped, kept, dropped,
+      thinnedBackground: thinned.length,
+      failures: failures.slice(0, 20),
+      failureCount: failures.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 // Write the cropped image + remapped labels to the sibling dataset.
 /**
  * Crop ONE region of an image and write it plus its remapped labels.
