@@ -101,6 +101,9 @@ export interface BBoxCanvasProps {
   fill?: boolean;
   /** Persistent crop rectangle overlay (normalized). Null = none set. */
   cropRegion?: CropRegion | null;
+  /** Regions already pinned via "＋ Region" — drawn read-only, and counted when
+   *  deciding whether a box survives the crop. */
+  extraRegions?: CropRegion[];
   /** "rect" = drag a rectangle; "polygon" = click vertices. Null = normal annotation. */
   cropMode?: CropMode;
   onCropRegionChange?: (r: CropRegion | null) => void;
@@ -122,6 +125,7 @@ export function BBoxCanvas({
   maxHeight = "calc(100vh - 140px)",
   fill = false,
   cropRegion = null,
+  extraRegions = [],
   cropMode = null,
   onCropRegionChange,
 }: BBoxCanvasProps) {
@@ -490,7 +494,11 @@ export function BBoxCanvas({
               const labelW = label.length * labelFontSize * 0.62 + labelPadX * 2;
               const labelH = labelFontSize + labelPadY * 2;
               // Preview which boxes survive the pending crop
-              const survives = !cropRegion || cropKeepRatio(b, cropRegion) >= CROP_KEEP_THRESHOLD;
+              // Each region is exported as its own crop, so a box is kept as long
+              // as it survives in at least one of them.
+              const allRegions = cropRegion ? [...extraRegions, cropRegion] : extraRegions;
+              const survives = allRegions.length === 0
+                || allRegions.some(r => cropKeepRatio(b, r) >= CROP_KEEP_THRESHOLD);
               return (
                 <g key={i} opacity={survives ? 1 : 0.22}>
                   <rect x={x} y={y} width={bw} height={bh} fill="none" stroke={color} strokeWidth={selected ? 4 : 2} />
@@ -526,6 +534,23 @@ export function BBoxCanvas({
                   <rect x={x} y={y} width={bw} height={bh} fill={color} fillOpacity={0.08} stroke={color} strokeWidth={2} strokeDasharray="6 3" />
                   <rect x={x} y={y - lh} width={lw} height={lh} fill={color} fillOpacity={0.7} rx={2} />
                   <text x={x + padX} y={y - padY - 1} fill="#000" fontSize={fontSize} fontWeight={600} dominantBaseline="auto">{label}</text>
+                </g>
+              );
+            })}
+            {/* Regions already pinned with "＋ Region": drawn read-only, in a distinct
+                colour, so it is obvious which one is being edited. */}
+            {extraRegions.map((r, i) => {
+              const c = normalizeCrop(r);
+              const x = c.x0 * imgSize.w, y = c.y0 * imgSize.h;
+              const w = (c.x1 - c.x0) * imgSize.w, h = (c.y1 - c.y0) * imgSize.h;
+              const pts = r.polygon && r.polygon.length >= 3
+                ? r.polygon.map(([px, py]) => [px * imgSize.w, py * imgSize.h] as const)
+                : null;
+              return (
+                <g key={`pinned-${i}`} opacity={0.85}>
+                  <rect x={x} y={y} width={w} height={h} fill="none" stroke="#3b82f6" strokeWidth={1} strokeDasharray="3 5" />
+                  {pts && <polygon points={pts.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke="#3b82f6" strokeWidth={2} />}
+                  <text x={x + 4} y={y + 14} fill="#3b82f6" fontSize={12} fontWeight={700}>{r.name || `zone${i + 1}`}</text>
                 </g>
               );
             })}

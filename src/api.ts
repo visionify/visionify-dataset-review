@@ -114,9 +114,9 @@ export const api = {
   saveTags: (split: string, base: string, tags: ImageTags) =>
     put<{ ok: boolean }>(`/tags/${encodeURIComponent(split)}/${encodeURIComponent(base)}`, tags),
   // Crop — export a sub-region to the sibling "<dataset>-cropped" dataset
-  cropImage: (split: string, name: string, region: CropRegion) =>
+  cropImage: (split: string, name: string, regions: CropRegion[]) =>
     post<{ ok: boolean; outputRoot: string; outImage: string; kept: number; dropped: number; width: number; height: number }>(
-      "/crop", { split, name, region }
+      "/crop", { split, name, regions }
     ),
   cropStatus: (split: string, name: string) =>
     get<{ exists: boolean; outputRoot: string | null }>(

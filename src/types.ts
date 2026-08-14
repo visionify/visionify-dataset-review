@@ -33,6 +33,8 @@ export type CropPoint = [number, number];
  * training data matches what the model sees at inference time.
  */
 export interface CropRegion {
+  /** Optional label; used to namespace output files when several regions are cropped. */
+  name?: string;
   x0: number;
   y0: number;
   x1: number;

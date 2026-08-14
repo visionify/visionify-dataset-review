@@ -1143,7 +1143,7 @@ async function copyDatasetMetaFiles(datasetRoot, outRoot) {
 }
 
 /** Resolve source/output paths for a croppable image, or an { error, status } object. */
-async function resolveCropPaths(datasetRoot, split, name) {
+async function resolveCropPaths(datasetRoot, split, name, outPrefix = "") {
   if (!datasetRoot.trim()) return { error: "no dataset configured", status: 400 };
   const config = await resolveConfig(datasetRoot);
   if (config.type === "classification") return { error: "crop is only supported for detection datasets", status: 400 };
@@ -1160,8 +1160,8 @@ async function resolveCropPaths(datasetRoot, split, name) {
   return {
     config, imagesRel, labelsRel, base, srcImage, outRoot,
     srcLabel: labelsRel ? path.join(datasetRoot, labelsRel, base + ".txt") : null,
-    outImage: path.join(outRoot, imagesRel, name),
-    outLabel: labelsRel ? path.join(outRoot, labelsRel, base + ".txt") : null,
+    outImage: path.join(outRoot, imagesRel, outPrefix + name),
+    outLabel: labelsRel ? path.join(outRoot, labelsRel, outPrefix + base + ".txt") : null,
   };
 }
 
@@ -1178,91 +1178,120 @@ app.get("/api/crop/status", async (req, res) => {
 });
 
 // Write the cropped image + remapped labels to the sibling dataset.
+/**
+ * Crop ONE region of an image and write it plus its remapped labels.
+ *
+ * Split out of the route so several regions can be exported for the same image
+ * in one request. `outPrefix` namespaces the output files: a camera whose zones
+ * sit far apart is cropped once per zone, and both crops land in the same output
+ * dataset without overwriting each other.
+ */
+async function cropOneRegion(datasetRoot, split, name, region, outPrefix) {
+  const p = await resolveCropPaths(datasetRoot, split, name, outPrefix);
+  if (p.error) return { error: p.error, status: p.status };
+
+  const meta = await sharp(p.srcImage).metadata();
+  const W = meta.width, H = meta.height;
+  if (!W || !H) return { error: "could not read image dimensions", status: 500 };
+
+  // A polygon defines its own bounding box; a bare rect uses the given corners.
+  const poly = Array.isArray(region.polygon) && region.polygon.length >= 3 ? region.polygon : null;
+  const bounds = poly ? polygonBounds(poly) : region;
+
+  // Normalized region -> integer pixel rect, clamped to the image
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const left = clamp(Math.round(Math.min(bounds.x0, bounds.x1) * W), 0, W - 1);
+  const top = clamp(Math.round(Math.min(bounds.y0, bounds.y1) * H), 0, H - 1);
+  const right = clamp(Math.round(Math.max(bounds.x0, bounds.x1) * W), left + 1, W);
+  const bottom = clamp(Math.round(Math.max(bounds.y0, bounds.y1) * H), top + 1, H);
+  const crop = { left, top, width: right - left, height: bottom - top };
+
+  // Polygon in source pixels (for label visibility) and crop-local pixels (for the mask)
+  const polyPx = poly ? poly.map(([px, py]) => [px * W, py * H]) : null;
+  const polyLocal = polyPx ? polyPx.map(([px, py]) => [px - crop.left, py - crop.top]) : null;
+
+  // Labels: read source, remap, write
+  let boxes = [];
+  if (p.srcLabel) {
+    try {
+      const content = await fs.readFile(p.srcLabel, "utf8");
+      boxes = content.split("\n").filter(l => l.trim()).map(line => {
+        const v = line.trim().split(/\s+/).map(Number);
+        return { classId: v[0], x: v[1], y: v[2], w: v[3], h: v[4] };
+      }).filter(b => Number.isFinite(b.x) && Number.isFinite(b.y) && Number.isFinite(b.w) && Number.isFinite(b.h));
+    } catch {}
+  }
+  const { boxes: remapped, dropped } = remapBoxesToCrop(boxes, crop, W, H, polyPx);
+
+  // Image
+  await fs.mkdir(path.dirname(p.outImage), { recursive: true });
+  const ext = path.extname(name).toLowerCase();
+  let pipeline = sharp(p.srcImage).extract(crop);
+
+  if (polyLocal) {
+    // Overlay a grey layer with a polygon-shaped hole (even-odd fill): pixels
+    // inside the polygon are untouched, everything else becomes CROP_MASK_GREY.
+    // Done as a single `over` composite because sharp applies flatten *before*
+    // composite in its fixed pipeline order — a dest-in + flatten pass would
+    // flatten the un-masked image and leave the masked area black.
+    const inner = polyLocal.map(([px, py], i) => `${i === 0 ? "M" : "L"} ${px.toFixed(2)} ${py.toFixed(2)}`).join(" ");
+    const d = `M 0 0 L ${crop.width} 0 L ${crop.width} ${crop.height} L 0 ${crop.height} Z ${inner} Z`;
+    const g = CROP_MASK_GREY;
+    const maskSvg = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${crop.width}" height="${crop.height}">` +
+      `<path d="${d}" fill="rgb(${g},${g},${g})" fill-rule="evenodd"/></svg>`
+    );
+    pipeline = pipeline.composite([{ input: maskSvg, blend: "over" }]);
+  }
+
+  if (ext === ".jpg" || ext === ".jpeg") pipeline = pipeline.jpeg({ quality: 95 });
+  else if (ext === ".png") pipeline = pipeline.png();
+  else if (ext === ".webp") pipeline = pipeline.webp({ quality: 95 });
+  await pipeline.toFile(p.outImage);
+
+  if (p.outLabel) {
+    await fs.mkdir(path.dirname(p.outLabel), { recursive: true });
+    await fs.writeFile(p.outLabel, remapped.map(b => `${b.classId} ${b.x} ${b.y} ${b.w} ${b.h}`).join("\n"), "utf8");
+  }
+
+  return {
+    ok: true, outputRoot: p.outRoot, outImage: p.outImage,
+    kept: remapped.length, dropped,
+    width: crop.width, height: crop.height, masked: !!polyLocal,
+  };
+}
+
+/**
+ * Output filename prefix for a region.
+ *
+ * Empty for a single region, so one-zone cameras produce byte-identical output
+ * to before this endpoint learned about multiple regions.
+ */
+function regionPrefix(region, index, total) {
+  if (total <= 1) return "";
+  const raw = (region && typeof region.name === "string" && region.name.trim()) || `zone${index + 1}`;
+  return raw.replace(/[^A-Za-z0-9_-]/g, "-") + "__";
+}
+
+// Write the cropped image + remapped labels to the sibling dataset.
+// Accepts a single `region` (legacy) or a `regions` array — one crop per region.
 app.post("/api/crop", async (req, res) => {
   const datasetRoot = getDatasetPath();
-  const { split, name, region } = req.body || {};
-  if (!split || !name || !region) return res.status(400).json({ error: "split, name and region required" });
-
-  const p = await resolveCropPaths(datasetRoot, String(split), String(name));
-  if (p.error) return res.status(p.status).json({ error: p.error });
+  const { split, name, region, regions } = req.body || {};
+  const list = Array.isArray(regions) && regions.length ? regions : (region ? [region] : []);
+  if (!split || !name || !list.length) return res.status(400).json({ error: "split, name and region(s) required" });
 
   try {
-    const meta = await sharp(p.srcImage).metadata();
-    const W = meta.width, H = meta.height;
-    if (!W || !H) return res.status(500).json({ error: "could not read image dimensions" });
-
-    // A polygon defines its own bounding box; a bare rect uses the given corners.
-    const poly = Array.isArray(region.polygon) && region.polygon.length >= 3 ? region.polygon : null;
-    const bounds = poly ? polygonBounds(poly) : region;
-
-    // Normalized region -> integer pixel rect, clamped to the image
-    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const left = clamp(Math.round(Math.min(bounds.x0, bounds.x1) * W), 0, W - 1);
-    const top = clamp(Math.round(Math.min(bounds.y0, bounds.y1) * H), 0, H - 1);
-    const right = clamp(Math.round(Math.max(bounds.x0, bounds.x1) * W), left + 1, W);
-    const bottom = clamp(Math.round(Math.max(bounds.y0, bounds.y1) * H), top + 1, H);
-    const crop = { left, top, width: right - left, height: bottom - top };
-
-    // Polygon in source pixels (for label visibility) and crop-local pixels (for the mask)
-    const polyPx = poly ? poly.map(([px, py]) => [px * W, py * H]) : null;
-    const polyLocal = polyPx ? polyPx.map(([px, py]) => [px - crop.left, py - crop.top]) : null;
-
-    // Labels: read source, remap, write
-    let boxes = [];
-    if (p.srcLabel) {
-      try {
-        const content = await fs.readFile(p.srcLabel, "utf8");
-        boxes = content.split("\n").filter(l => l.trim()).map(line => {
-          const v = line.trim().split(/\s+/).map(Number);
-          return { classId: v[0], x: v[1], y: v[2], w: v[3], h: v[4] };
-        }).filter(b => Number.isFinite(b.x) && Number.isFinite(b.y) && Number.isFinite(b.w) && Number.isFinite(b.h));
-      } catch {}
+    const results = [];
+    for (let i = 0; i < list.length; i++) {
+      const r = await cropOneRegion(datasetRoot, String(split), String(name), list[i], regionPrefix(list[i], i, list.length));
+      if (r.error) return res.status(r.status || 500).json({ error: r.error });
+      results.push({ ...r, region: (list[i] && list[i].name) || `zone${i + 1}` });
     }
-    const { boxes: remapped, dropped } = remapBoxesToCrop(boxes, crop, W, H, polyPx);
+    await copyDatasetMetaFiles(datasetRoot, results[0].outputRoot);
 
-    // Image
-    await fs.mkdir(path.dirname(p.outImage), { recursive: true });
-    const ext = path.extname(name).toLowerCase();
-    let pipeline = sharp(p.srcImage).extract(crop);
-
-    if (polyLocal) {
-      // Overlay a grey layer with a polygon-shaped hole (even-odd fill): pixels
-      // inside the polygon are untouched, everything else becomes CROP_MASK_GREY.
-      // Done as a single `over` composite because sharp applies flatten *before*
-      // composite in its fixed pipeline order — a dest-in + flatten pass would
-      // flatten the un-masked image and leave the masked area black.
-      const inner = polyLocal.map(([px, py], i) => `${i === 0 ? "M" : "L"} ${px.toFixed(2)} ${py.toFixed(2)}`).join(" ");
-      const d = `M 0 0 L ${crop.width} 0 L ${crop.width} ${crop.height} L 0 ${crop.height} Z ${inner} Z`;
-      const g = CROP_MASK_GREY;
-      const maskSvg = Buffer.from(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${crop.width}" height="${crop.height}">` +
-        `<path d="${d}" fill="rgb(${g},${g},${g})" fill-rule="evenodd"/></svg>`
-      );
-      pipeline = pipeline.composite([{ input: maskSvg, blend: "over" }]);
-    }
-
-    if (ext === ".jpg" || ext === ".jpeg") pipeline = pipeline.jpeg({ quality: 95 });
-    else if (ext === ".png") pipeline = pipeline.png();
-    else if (ext === ".webp") pipeline = pipeline.webp({ quality: 95 });
-    await pipeline.toFile(p.outImage);
-
-    if (p.outLabel) {
-      await fs.mkdir(path.dirname(p.outLabel), { recursive: true });
-      await fs.writeFile(p.outLabel, remapped.map(b => `${b.classId} ${b.x} ${b.y} ${b.w} ${b.h}`).join("\n"), "utf8");
-    }
-
-    await copyDatasetMetaFiles(datasetRoot, p.outRoot);
-
-    res.json({
-      ok: true,
-      outputRoot: p.outRoot,
-      outImage: p.outImage,
-      kept: remapped.length,
-      dropped,
-      width: crop.width,
-      height: crop.height,
-      masked: !!polyLocal,
-    });
+    // Legacy-shaped response for a single region; `regions` always present.
+    res.json({ ...results[0], regions: results });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }

@@ -8,6 +8,10 @@ import type { BBox, CropRegion, ImageItem, ClassItem } from "@/types";
 
 const DEFAULT_CLASS_KEY = "pallet-review-default-class";
 const CROP_REGION_KEY = "pallet-review-crop-region";
+// Additional crop regions, for a camera whose zones sit far apart: each is
+// exported as its own crop of the same image, so the model sees each zone at
+// its own scale rather than one wide crop spanning both.
+const CROP_EXTRA_REGIONS_KEY = "pallet-review-crop-regions";
 const LOAD_LIMIT = 5000;
 
 export default function ImageDetailPage() {
@@ -46,6 +50,7 @@ export default function ImageDetailPage() {
   const [moveTarget, setMoveTarget] = useState("");
   const [moving, setMoving] = useState(false);
   const [cropRegion, setCropRegionState] = useState<CropRegion | null>(null);
+  const [extraRegions, setExtraRegionsState] = useState<CropRegion[]>([]);
   const [cropMode, setCropMode] = useState<CropMode>(null);
   const [cropping, setCropping] = useState(false);
   const [cropExists, setCropExists] = useState(false);
@@ -85,11 +90,23 @@ export default function ImageDetailPage() {
     } catch {}
   }, []);
 
+  const setExtraRegions = useCallback((rs: CropRegion[]) => {
+    setExtraRegionsState(rs);
+    try {
+      if (rs.length) localStorage.setItem(CROP_EXTRA_REGIONS_KEY, JSON.stringify(rs));
+      else localStorage.removeItem(CROP_EXTRA_REGIONS_KEY);
+    } catch {}
+  }, []);
+
   // Load persisted default class + crop region
   useEffect(() => {
     try {
       const s = localStorage.getItem(DEFAULT_CLASS_KEY);
       if (s != null) { const n = parseInt(s, 10); if (!isNaN(n)) setDefaultClassIdState(n); }
+    } catch {}
+    try {
+      const xs = localStorage.getItem(CROP_EXTRA_REGIONS_KEY);
+      if (xs) { const arr = JSON.parse(xs); if (Array.isArray(arr)) setExtraRegionsState(arr); }
     } catch {}
     try {
       const s = localStorage.getItem(CROP_REGION_KEY);
@@ -391,10 +408,16 @@ export default function ImageDetailPage() {
     try {
       // Persist any in-progress annotation edits first — the crop reads labels from disk
       await api.saveAnnotations(currentImage.split, imageBase(currentImage.name), boxesRef.current);
-      const r = await api.cropImage(currentImage.split, currentImage.name, cropRegion);
+      // Active region last so its index-based fallback name stays stable as
+      // regions are added; the server namespaces output files per region.
+      const all = [...extraRegions, cropRegion];
+      const r = await api.cropImage(currentImage.split, currentImage.name, all);
       setCropExists(true);
       markReviewed();
-      setCropInfo(`Cropped ${r.width}×${r.height} · ${r.kept} box${r.kept === 1 ? "" : "es"} kept${r.dropped ? `, ${r.dropped} dropped` : ""}`);
+      const n = extraRegions.length + 1;
+      setCropInfo(n > 1
+        ? `Cropped ${n} regions · ${r.width}×${r.height} first`
+        : `Cropped ${r.width}×${r.height} · ${r.kept} box${r.kept === 1 ? "" : "es"} kept${r.dropped ? `, ${r.dropped} dropped` : ""}`);
       notify("Cropped", "success");
     } catch (e) {
       notify(e instanceof Error ? e.message : "Crop failed", "error", 4000);
@@ -402,7 +425,7 @@ export default function ImageDetailPage() {
       cropInFlight.current = false;
       setCropping(false);
     }
-  }, [currentImage, cropRegion, cropMode, isCls, markReviewed, notify]);
+  }, [currentImage, cropRegion, extraRegions, cropMode, isCls, markReviewed, notify]);
 
   const startCrop = useCallback((mode: "rect" | "polygon") => {
     setCropRegion(null);
@@ -594,9 +617,25 @@ export default function ImageDetailPage() {
                 <button className="btn btn-ghost" onClick={() => startCrop("polygon")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Clear the region and click a new polygon">
                   ⬠
                 </button>
-                <button className="btn btn-ghost" onClick={() => setCropRegion(null)} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Remove the crop region">
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => { setExtraRegions([...extraRegions, cropRegion]); setCropRegion(null); startCrop("rect"); }}
+                  style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
+                  title="Keep this region and draw another — each region is exported as its own crop"
+                >
+                  ＋ Region
+                </button>
+                <button className="btn btn-ghost" onClick={() => { setCropRegion(null); setExtraRegions([]); }} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} title="Remove all crop regions">
                   Clear
                 </button>
+                {extraRegions.length > 0 && (
+                  <span
+                    style={{ fontSize: "0.75rem", padding: "1px 6px", borderRadius: 3, background: "rgba(59,130,246,0.18)", color: "#1d4ed8", fontWeight: 600, whiteSpace: "nowrap" }}
+                    title="Each region is cropped separately; output files are prefixed zone1__, zone2__ …"
+                  >
+                    {extraRegions.length + 1} regions
+                  </span>
+                )}
                 {/* Always rendered — only its visibility toggles, so it never reflows */}
                 <span
                   style={{ fontSize: "0.75rem", padding: "1px 6px", borderRadius: 3, background: "rgba(245,158,11,0.18)", color: "#b45309", fontWeight: 600, whiteSpace: "nowrap", visibility: cropExists ? "visible" : "hidden" }}
@@ -699,6 +738,7 @@ export default function ImageDetailPage() {
             onAcceptPrediction={acceptPrediction}
             cropRegion={cropRegion}
             cropMode={cropMode}
+            extraRegions={extraRegions}
             onCropRegionChange={handleCropRegionChange}
             fill
           />
