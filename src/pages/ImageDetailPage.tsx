@@ -663,9 +663,9 @@ export default function ImageDetailPage() {
                 </button>
                 <button
                   className="btn btn-ghost"
-                  onClick={() => { setExtraRegions([...extraRegions, cropRegion]); setCropRegion(null); startCrop("rect"); }}
+                  onClick={() => { setExtraRegions([...extraRegions, cropRegion]); setCropRegion(null); }}
                   style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }}
-                  title="Keep this region and draw another — each region is exported as its own crop"
+                  title="Pin this region, then pick ▭ or ⬠ for the next one — each region is exported as its own crop"
                 >
                   ＋ Region
                 </button>
@@ -690,6 +690,14 @@ export default function ImageDetailPage() {
               </>
             ) : (
               <>
+                {extraRegions.length > 0 && (
+                  <span
+                    style={{ fontSize: "0.75rem", padding: "1px 6px", borderRadius: 3, background: "rgba(59,130,246,0.18)", color: "#1d4ed8", fontWeight: 600, whiteSpace: "nowrap" }}
+                    title="Pinned regions — draw the next one, then Crop exports all of them"
+                  >
+                    {extraRegions.length} pinned
+                  </span>
+                )}
                 <button className="btn btn-ghost" onClick={() => startCrop("rect")} style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", whiteSpace: "nowrap" }} title="Drag a rectangular crop region, then press X to save crops">
                   ▭ Rect crop
                 </button>
